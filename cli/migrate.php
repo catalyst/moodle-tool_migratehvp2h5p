@@ -29,6 +29,7 @@ define('CLI_SCRIPT', true);
 require(__DIR__ . '/../../../../config.php');
 require_once("{$CFG->libdir}/clilib.php");
 require_once("{$CFG->libdir}/cronlib.php");
+require_once($CFG->libdir . '/csvlib.class.php');
 
 list($options, $unrecognized) = cli_get_params(
     [
@@ -38,6 +39,7 @@ list($options, $unrecognized) = cli_get_params(
         'keeporiginal' => 1,
         'copy2cb' => api::COPY2CBYESWITHLINK,
         'contenttypes' => [],
+        'csvfile' => '',
     ], [
         'e' => 'execute',
         'h' => 'help',
@@ -45,6 +47,7 @@ list($options, $unrecognized) = cli_get_params(
         'k' => 'keeporiginal',
         'c' => 'copy2cb',
         't' => 'contenttypes',
+        'f' => 'csvfile',
     ]
 );
 
@@ -66,6 +69,7 @@ Options:
                            Only contents having these libraries defined as main library will be migrated.
  -l  --limit=N             The maximmum number of activities per execution (default 100).
                            Already migrated activities will be ignored.
+ -f  --csvfile             If given, will output data before and after to the given CSV.
 
 Example:
 \$sudo -u www-data /usr/bin/php admin/tool/migratehvp2h5p/cli/migrate.php --execute
@@ -143,6 +147,64 @@ cron_setup_user();
 $humantimenow = date('r', time());
 
 mtrace("Server Time: {$humantimenow}\n");
+
+// Load CSV file for writing if given.
+if (!empty($options['csvfile'])) {
+    global $DB;
+    $writer = new csv_export_writer();
+    $writer->add_data(['oldcmid', 'oldname', 'oldembed', 'newcmid', 'newname', 'newembed']);
+
+    // Query all migrated activities.
+    // Internally, this is how the migration tool knows which matches (name course and timecreated).
+    // Note, this assumes you are not deleting them afterwards (otherwise the old course modules will not exist anymore).
+    $sql = "
+        SELECT hvp.id as hvpid, hvp.name, hvp.course, h5pactivity.id as h5pactivityid, h5pactivity.name,h5pactivity.course
+        FROM mdl_hvp hvp
+        LEFT JOIN mdl_h5pactivity h5pactivity
+        ON hvp.name = h5pactivity.name
+        AND hvp.course = h5pactivity.course
+        AND hvp.timecreated = h5pactivity.timecreated
+        WHERE h5pactivity.id IS NOT NULL
+    ";
+    $records = $DB->get_records_sql($sql);
+
+    foreach ($records as $record) {
+        // Build the new embed link.
+        // For new h5pactivty, this is based off the 'package' file.
+        // We do not know the name of this file, so it must be queried.
+        $newcm = get_coursemodule_from_instance('h5pactivity', $record->h5pactivityid);
+        $newcontext = context_module::instance($newcm->id);
+        $fs = get_file_storage();
+        $h5pcontentfile = current($fs->get_area_files($newcontext->id, 'mod_h5pactivity', 'package', 0, "itemid", false));
+        $newh5pfileurl = moodle_url::make_pluginfile_url(
+            $h5pcontentfile->get_contextid(),
+            $h5pcontentfile->get_component(),
+            $h5pcontentfile->get_filearea(),
+            $h5pcontentfile->get_itemid(),
+            $h5pcontentfile->get_filepath(),
+            $h5pcontentfile->get_filename(),
+            false
+        );
+        $newlink = new moodle_url('/h5p/embed.php', ['url' => $newh5pfileurl]);
+        $newlinkrelative = $newlink->get_path() . '?' . $newlink->get_query_string();
+
+        // The old mod_hvp embed links only use the cmid.
+        $oldcm = get_coursemodule_from_instance('hvp', $record->hvpid);
+        $oldlink = new moodle_url('/mod/hvp/embed.php', ['id' => $oldcm->id]);
+        $oldlinkrelative = $oldlink->get_path() . '?' . $oldlink->get_query_string();
+
+        // Write this to the CSV.
+        $data = [$oldcm->id, $oldcm->name, $oldlinkrelative, $newcm->id, $newcm->name, $newlinkrelative];
+        $writer->add_data($data);
+    }
+
+    $output = $writer->print_csv_data(true);
+    file_put_contents($options['csvfile'], $output);
+    mtrace("Done writing to CSV output file");
+
+    // Do not migrate if csv is given, csv is only for outputting.
+    exit(1);
+}
 
 mtrace("Search for $limit non migrated hvp activites\n");
 
